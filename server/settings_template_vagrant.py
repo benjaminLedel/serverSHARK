@@ -22,7 +22,7 @@ HPC = {
     'host': 'xxx',
     'port': 22,
     'queue': 'xx',
-    'node_properties': [],
+    'tasks_per_node': [],
     'root_path': 'xxx',
     'log_path': 'xxx',
     'ssh_tunnel_username': '',
@@ -30,7 +30,9 @@ HPC = {
     'ssh_tunnel_host': '',
     'ssh_tunnel_port': '',
     'ssh_use_tunnel': '',
-    'cores_per_job': 1
+    'cores_per_job': 1,
+    'local_log_path': '',
+    'hosts_per_job': 1
 }
 
 

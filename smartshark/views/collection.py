@@ -245,15 +245,18 @@ def start_collection(request):
                 # Set execution history with execution values for the plugin execution
                 set_argument_execution_values(form.cleaned_data, plugin_executions)
 
-                # Create jobs and execute them in a separate thread
-                thread = JobSubmissionThread(project, plugin_executions)
-                thread.start()
+            # Create jobs and execute them in a separate thread
+            thread = JobSubmissionThread(project, plugin_executions)
+            thread.start()
 
             return HttpResponseRedirect('/admin/smartshark/project')
 
     # if a GET (or any other method) we'll create a blank form
     else:
-        form = get_form(plugins, request.POST or None, 'execute', project)
+        initial_exec_type = request.GET.get('initial_exec_type', None)
+        initial_revisions = request.GET.get('initial_revisions', None)
+
+        form = get_form(plugins, request.POST or None, 'execute', project, initial_exec_type=initial_exec_type, initial_revisions=initial_revisions)
 
     return render(request, 'smartshark/project/execution.html', {
         'form': form,
@@ -328,10 +331,8 @@ def installgithub(request):
             url = request.POST.get('repo_url')
         if 'select' in request.POST:
             url = url.replace('https://www.github.com/', 'https://api.github.com/repos/')
-            url = url.replace('https://github.com/','https://api.github.com/repos/')
+            url = url.replace('https://github.com/', 'https://api.github.com/repos/')
             url = url + '/releases'
-
-        print(url)
 
         webURL = urllib.request.urlopen(url)
         html = webURL.read()
@@ -354,7 +355,7 @@ def installgithub(request):
             for data in jsonData:
                 if version == data["tag_name"]:
 
-                    if(data["assets"] == None or data["assets"][0] == None):
+                    if(data["assets"] is None or len(data["assets"]) == 0):
                         return render(request, 'smartshark/plugin/github/select.html',
                                       {
                                           'versions': versions,
@@ -379,7 +380,7 @@ def installgithub(request):
         return render(request, 'smartshark/plugin/github/select.html',
         {
             'versions': versions,
-            'status': 'Installation successful',
+            'status': 'Plugin download successful',
             'url': url,
             'success': True
         })

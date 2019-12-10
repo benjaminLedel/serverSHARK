@@ -1,27 +1,68 @@
+import logging
+
 from django.contrib import admin
 from django.contrib.auth.models import User
 from django.contrib.auth.admin import UserAdmin
+from django.template.response import TemplateResponse
 
 from django.contrib.messages import get_messages
 from django.contrib import messages
+from django.contrib.admin import SimpleListFilter
 
 from django.core.exceptions import ValidationError
 from django.core.urlresolvers import reverse
 from django.http import HttpResponseRedirect
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils.safestring import mark_safe
+from django.db.models import Q
 
 from smartshark.datacollection.pluginmanagementinterface import PluginManagementInterface
+from smartshark.mongohandler import handler
 
 from .views.collection import JobSubmissionThread
 from .models import MongoRole, SmartsharkUser, Plugin, Argument, Project, Job, PluginExecution, ExecutionHistory, CommitVerification
 
+logger = logging.getLogger('django')
 
 admin.site.unregister(User)
 
 
+class PluginFailedListFilter(SimpleListFilter):
+    title = 'Plugin Failed'
+    parameter_name = 'plugin_failed'
+
+    def lookups(self, request, model_admin):
+        return (
+            ('failure', 'At least one plugin failed'),
+            ('success', 'All plugins succeeded'),
+        )
+
+    def queryset(self, request, queryset):
+        if self.value() == 'failure':
+            return queryset.filter(Q(mecoSHARK=False) | Q(coastSHARK=False))
+        else:
+            return queryset.all()
+
+class CoastRecheckListFilter(SimpleListFilter):
+    title = 'coastSHARK re-checked'
+    parameter_name = 'coast_recheck'
+
+    def lookups(self, request, model_admin):
+        return (
+            ('recheck', 'CoastSHARK recheck ran'),
+            ('no_recheck', 'No recheck ran'),
+        )
+
+    def queryset(self, request, queryset):
+        if self.value() == 'recheck':
+            return queryset.filter(text__contains='Parser Error in file')
+        else:
+            return queryset.all()
+
+
+
 class JobAdmin(admin.ModelAdmin):
-    list_display = ('job_id', 'plugin_execution', 'status', 'revision_hash')
+    list_display = ('id', 'plugin_execution', 'status', 'revision_hash')
     list_filter = ('plugin_execution__project', 'plugin_execution__plugin', 'status', 'plugin_execution__execution_type')
     search_fields = ('revision_hash',)
 
@@ -68,6 +109,15 @@ class JobAdmin(admin.ModelAdmin):
             new_plugin_execution = PluginExecution.objects.get(pk=old_pk)
             new_plugin_execution.pk = None
             new_plugin_execution.status = 'WAIT'
+
+            # if we restart one or multiple jobs we need to set the plugin execution type to that
+            # otherwise we would have a full plugin_execution on one or multiple jobs instead of a
+            # plugin execution for specific revisions
+            new_plugin_execution.execution_type = 'rev'
+
+            # create comma separated list of job revision_hashes from selected jobs
+            new_plugin_execution.revisions = ','.join([Job.objects.get(pk=j.pk).revision_hash for j in jobs])
+
             new_plugin_execution.save()
 
             # create new execution history objects based on the old
@@ -77,6 +127,7 @@ class JobAdmin(admin.ModelAdmin):
                 new_eh.plugin_execution = new_plugin_execution
                 new_eh.save()
 
+            # create new jobs from old jobs
             for old_job in jobs:
                 new_job = Job.objects.get(pk=old_job.pk)
                 new_job.pk = None
@@ -329,15 +380,209 @@ class ProjectAdmin(admin.ModelAdmin):
     delete_data.short_description = 'Delete all data for selected Projects'
 
 
-
 class CommitVerificationAdmin(admin.ModelAdmin):
-    def has_add_permission(self, request, obj=None):
-        return False
+
     list_display = ('commit', 'project', 'vcsSHARK', 'mecoSHARK',
                     'coastSHARK')
     search_fields = ('commit',)
-    list_filter = ('project__name', 'vcsSHARK', 'mecoSHARK', 'coastSHARK')
+    list_filter = ('project__name', 'vcsSHARK', 'mecoSHARK', 'coastSHARK', PluginFailedListFilter, CoastRecheckListFilter)
 
+    actions = ['delete_ces_list', 'check_coast_parse_error', 'restart_coast', 'restart_meco', 'recheck_coast_parse_error']
+
+    def has_add_permission(self, request, obj=None):
+        return False
+
+    def _die_on_multiple_projects(self, queryset):
+        project = queryset[0].project
+        for c in queryset:
+            if c.project != project:
+                raise Exception('Queryset contains multiple projects!')
+
+    def restart_meco(self, request, queryset):
+        return self._restart_plugin(request, queryset, 'mecoSHARK')
+
+    def restart_coast(self, request, queryset):
+        return self._restart_plugin(request, queryset, 'coastSHARK')
+
+    def _restart_plugin(self, request, queryset, plugin_name):
+        self._die_on_multiple_projects(queryset)
+
+        if request.POST.get('post'):
+            
+            project_id = request.POST.get('project_id', None)
+            if not project_id:
+                raise Exception('no project selected')
+
+            plugin_id = request.POST.get('plugin_id', None)
+            if not plugin_id:
+                raise Exception('no plugin selected')
+
+            revisions = request.POST.get('revisions', None)
+            if not revisions:
+                raise Exception('no revisions selected')
+
+            return HttpResponseRedirect('/smartshark/project/collection/start/?plugins={}&project_id={}&initial_exec_type=rev&initial_revisions={}'.format(plugin_id, project_id, revisions))
+
+        else:
+            project = queryset[0].project
+            plugins = Plugin.objects.filter(name=plugin_name, active=True, installed=True)
+
+            request.current_app = self.admin_site.name
+            context = {
+                **self.admin_site.each_context(request),
+                'opts': self.model._meta,
+                'title': 'Restart Plugin ' + plugin_name,
+                'project': project,
+                'queryset': queryset,
+                'revisions': ','.join([obj.commit for obj in queryset]),
+                'num_revisions': len(queryset),
+                'plugins': plugins,
+            }
+
+            return TemplateResponse(request, 'admin/confirm_restart_plugin.html', context)
+
+    def recheck_coast_parse_error(self, request, queryset):
+        # die on multiple projects!
+        self._die_on_multiple_projects(queryset)
+
+        interface = PluginManagementInterface.find_correct_plugin_manager()
+
+        # we need to get the most current job for each commit (because of repetitions for coastSHARK runs)
+        jobs = {}
+        for pe in PluginExecution.objects.filter(plugin__name__startswith='coastSHARK', project=queryset[0].project).order_by('submitted_at'):
+            for obj in queryset:
+                try:
+                    jobs[obj.commit] = Job.objects.get(plugin_execution=pe, revision_hash=obj.commit)
+                except Job.DoesNotExist:
+                    pass
+
+        modified = 0
+        not_modified = []
+        for obj in queryset:
+            # split of file for coastSHARK
+            tmp = obj.text
+            collect_state = False
+            coast_files = []
+            for line in tmp.split('\n'):
+                if collect_state and not line.strip().startswith('+++ mecoSHARK +++'):
+                    coast_files.append(line.strip()[1:])
+                if line.strip().startswith('+++ coastSHARK +++'):
+                    collect_state = True
+                if line.strip().startswith('+++ mecoSHARK +++'):
+                    collect_state = False
+
+            job = jobs[obj.commit]
+            stdout = interface.get_output_log(job)
+
+            new_lines = []
+            parse_error_files = []
+            for file in coast_files:
+                for line in stdout:
+                    if file in line and line.startswith(('Parser Error in file', 'Lexer Error in file')):
+                        new_lines.append(file + ' ({})'.format(line))
+                        parse_error_files.append(file)
+
+            if set(parse_error_files) == set(coast_files):
+                modified += 1
+            else:
+                not_modified.append(obj.commit)
+
+        logger.info('no change to True on following commits: {}'.format(not_modified))
+        messages.info(request, 'Would fix coastSHARK verification on {} of {} commits.'.format(modified, len(queryset)))
+
+    def check_coast_parse_error(self, request, queryset):
+        # die on multiple projects!
+        self._die_on_multiple_projects(queryset)
+
+        interface = PluginManagementInterface.find_correct_plugin_manager()
+
+        # we need to get the most current job for each commit (because of repetitions for coastSHARK runs)
+        jobs = {}
+        for pe in PluginExecution.objects.filter(plugin__name__startswith='coastSHARK', project=queryset[0].project).order_by('submitted_at'):
+            for obj in queryset:
+                try:
+                    jobs[obj.commit] = Job.objects.get(plugin_execution=pe, revision_hash=obj.commit)
+                except Job.DoesNotExist:
+                    pass
+                except Job.MultipleObjectsReturned:
+                    job_ids = [str(job.id) for job in Job.objects.filter(plugin_execution=pe, revision_hash=obj.commit)]
+                    messages.warning(request, 'Commit: {} has more than one Job, ignoring it, job_ids ({})'.format(obj.commit, ','.join(job_ids)))
+
+        modified = 0
+        for obj in queryset:
+            # split of file for coastSHARK
+            tmp = obj.text
+            collect_state = False
+            coast_files = []
+            for line in tmp.split('\n'):
+                if collect_state and not line.strip().startswith('+++ mecoSHARK +++'):
+                    coast_files.append(line.strip()[1:])
+                if line.strip().startswith('+++ coastSHARK +++'):
+                    collect_state = True
+                if line.strip().startswith('+++ mecoSHARK +++'):
+                    collect_state = False
+
+            job = jobs[obj.commit]
+            stdout = interface.get_output_log(job)
+
+            new_lines = []
+            parse_error_files = []
+            for file in coast_files:
+                for line in stdout:
+                    if file in line and line.startswith(('Parser Error in file', 'Lexer Error in file')):
+                        new_lines.append(file + ' ({})'.format(line))
+                        parse_error_files.append(file)
+
+            if set(parse_error_files) == set(coast_files):
+                obj.coastSHARK = True
+                modified += 1
+
+            if new_lines:
+                obj.text = '\n'.join(new_lines) + '\n----\n' + obj.text
+                obj.save()
+        messages.info(request, 'Changed coastSHARK verification to True on {} of {} commits.'.format(modified, len(queryset)))
+
+    def delete_ces_list(self, request, queryset):
+        # die on multiple projects!
+        self._die_on_multiple_projects(queryset)
+
+        # show validation with additional information, re-running plugins (mecoSHARK, coastSHARK for XYZ commits)
+        if request.POST.get('post'):
+
+            revisions = request.POST.get('revisions', None)
+            if not revisions:
+                raise Exception('no revisions selected')
+
+            logger.info('Setting code_entity_states to an empty list for these commits: {}'.format(revisions))
+            # we could now delete the code_entity_state lists of the commits in revisions
+            del_list_count, changed_commit_id_count, should_change_commit_ids, childs = handler.clear_code_entity_state_lists(revisions, queryset[0].vcs_system)
+            logger.info('Deleted code_entity_states list for {} commits, changed commit_id on {}/{} code entity states for {} childs'.format(del_list_count, changed_commit_id_count, should_change_commit_ids, childs))
+
+            messages.info(request, 'Deleted code_entity_states list for {} commits, changed commit_id on {}/{} code entity states for {} childs'.format(del_list_count, changed_commit_id_count, should_change_commit_ids, childs))
+
+            # todo: we could try to retain the query_string here (also from the form)
+            return HttpResponseRedirect('/admin/smartshark/commitverification/')
+
+        else:
+            project = queryset[0].project
+
+            vcs_system = queryset[0].vcs_system
+            for c in queryset:
+                if c.vcs_system != vcs_system:
+                    raise Exception('Queryset contains multiple vcs systems')
+
+            request.current_app = self.admin_site.name
+            context = {
+                **self.admin_site.each_context(request),
+                'opts': self.model._meta,
+                'title': 'Delete CodeEntityState lists',
+                'project': project,
+                'queryset': queryset,
+                'revisions': ','.join([obj.commit for obj in queryset]),
+                'num_revisions': len(queryset)
+            }
+
+            return TemplateResponse(request, 'admin/confirm_ces_list_deletion.html', context)
 
 admin.site.register(CommitVerification, CommitVerificationAdmin)
 admin.site.register(User, MyUserAdmin)

@@ -5,8 +5,17 @@ from collections import defaultdict
 import pygit2
 import re
 
-from smartshark.models import Job
+from django.db.models import Q
+
+from smartshark.models import Job, CommitVerification
 from smartshark.mongohandler import handler
+
+
+def get_revisions_for_failed_verification(project):
+    # we ensure that commits missing vcsSHARK are first
+    vcs = [cv.commit for cv in CommitVerification.objects.filter(project=project).filter(vcsSHARK=False)]
+    plugins = [cv.commit for cv in CommitVerification.objects.filter(project=project).filter(Q(mecoSHARK=False) | Q(coastSHARK=False)).filter(vcsSHARK=True)]
+    return vcs + plugins
 
 
 def get_revisions_for_failed_plugins(plugins, project):
@@ -21,45 +30,6 @@ def get_all_revisions(plugin_execution):
     revisions = set()
     for rev in handler.get_revisions_for_url(plugin_execution.repository_url):
         revisions.add(rev['revision_hash'])
-    return revisions
-
-
-def get_all_revisions_clone(plugin_execution):
-    """Return all revisions via live cloning the repository url."""
-    revisions = set()
-    path_to_repo = os.path.join(os.path.dirname(__file__), 'temp', plugin_execution.project.name)
-
-    # Clone project
-    subprocess.run(['git', 'clone', plugin_execution.repository_url, path_to_repo])
-
-    discovered_repo = pygit2.discover_repository(path_to_repo)
-    repository = pygit2.Repository(discovered_repo)
-
-    # Get all references (branches, tags)
-    references = set(repository.listall_references())
-
-    # Get all tags
-    regex = re.compile('^refs/tags')
-    tags = set(filter(lambda r: regex.match(r), repository.listall_references()))
-
-    # Get all branches
-    branches = references - tags
-
-    for branch in branches:
-        commit = repository.lookup_reference(branch).peel()
-        # Walk through every child
-        for child in repository.walk(commit.id, pygit2.GIT_SORT_TIME | pygit2.GIT_SORT_TOPOLOGICAL):
-            revisions.add(str(child.id))
-
-    # Walk through every tag and put the information in the dictionary via the addtag method
-    for tag in tags:
-        tagged_commit = repository.lookup_reference(tag).peel()
-        revisions.add(str(tagged_commit.id))
-        for child in repository.walk(tagged_commit.id, pygit2.GIT_SORT_TIME | pygit2.GIT_SORT_TOPOLOGICAL):
-            revisions.add(str(child.id))
-
-    subprocess.run(['rm', '-rf', path_to_repo])
-
     return revisions
 
 
@@ -142,6 +112,9 @@ def create_jobs_for_execution(project, plugin_executions):
                 revisions = get_revisions_for_failed_plugins([plugin_execution.plugin], plugin_execution.project)
                 for revision in revisions:
                     revisions_to_execute_plugin_on.append(revision)
+
+            elif plugin_execution.execution_type == 'ver':
+                revisions_to_execute_plugin_on = get_revisions_for_failed_verification(plugin_execution.project)
 
             # Create command
             for revision in revisions_to_execute_plugin_on:

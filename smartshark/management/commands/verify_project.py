@@ -2,13 +2,19 @@
 # -*- coding: utf-8 -*-
 
 import sys
+import os
+import tempfile
+
+import pygit2
 
 from django.core.management.base import BaseCommand
+from django.db import connections
 
 from smartshark.models import Project, CommitVerification
 from smartshark.mongohandler import handler
 from smartshark.utils.projectUtils import create_local_repo_for_project, get_all_commits_of_repo, get_commit_from_database, get_code_entities_from_database
-import pygit2,os
+from smartshark.datacollection.executionutils import get_revisions_for_failed_verification
+
 
 class Command(BaseCommand):
     help = 'Verify a project'
@@ -26,55 +32,92 @@ class Command(BaseCommand):
             self.stdout.write(self.style.ERROR('Error loading project: {}'.format(e)))
             sys.exit(-1)
 
-        path = "../tmp-repo"
-        projectMongo = self.db.project.find_one({"name": project.name})
-        print(projectMongo["_id"])
-        vcsMongo = self.db.vcs_system.find_one({"project_id": projectMongo["_id"]})
+        # add ability to request run without memeshark (which will be the default at one time in the future)
+        self.use_meme = True
+        l2 = input('did memeSHARK run for project {}? (Y/n)'.format(project.name))
+        if l2.lower() == 'n':
+            self.use_meme = False
+        self.stdout.write('Assuming memeSHARK {}'.format(self.use_meme))
 
-        l = input("Delete old verification data first? (Y/N)")
-        if(l == "y" or l == "Y"):
-            CommitVerification.objects.filter(project_id=project).delete()
-            self.stdout.write("Deleted old verification data")
+        # add ability to request run on only previously failed commit verifications
+        self.only_failed = False
+        l3 = input('only re-check previously failed commits? (y/N)')
+        if l3.lower() == 'y':
+            self.only_failed = True
+            self.stdout.write('Only checking previously failed commits')
 
-        repo = create_local_repo_for_project(vcsMongo, path)
-        if not repo.is_empty:
-            allCommits = get_all_commits_of_repo(vcsMongo, repo)
-            self.stdout.write("Found {} commits for the project".format(len(allCommits)))
+        with tempfile.TemporaryDirectory() as path:
+            projectMongo = self.db.project.find_one({"name": project.name})
 
-            # 2. Iterate over the commits
-            for commit in allCommits:
-                print("Commit " + commit)
+            vcsMongo = self.db.vcs_system.find_one({"project_id": projectMongo["_id"]})
 
-                # Add primary keys to the model
-                resultModel = CommitVerification()
-                resultModel.project = project
-                resultModel.vcs_system = vcsMongo["url"]
-                resultModel.commit = str(commit)
-                resultModel.text = ""
+            if not self.only_failed:
+                l = input("Delete old verification data first? (y/N)")
+                if l.lower() == 'y':
+                    CommitVerification.objects.filter(project=project).delete()
+                    self.stdout.write("Deleted old verification data")
 
-                db_commit = get_commit_from_database(self.db, commit, vcsMongo["_id"])
+            repo = create_local_repo_for_project(vcsMongo, path, project.name)
 
-                # Basic validation wihtout checkout the version
-                resultModel.vcsSHARK = self.validate_vcsSHARK(db_commit, repo, resultModel)
+            if not repo.is_empty:
 
-                # Checkout, to validate also on file level
-                ref = repo.create_reference('refs/tags/temp', commit)
-                repo.checkout(ref)
+                if not self.only_failed:
+                    allCommits = get_all_commits_of_repo(vcsMongo, repo)
+                    self.stdout.write("Found {} commits for the project".format(len(allCommits)))
+                else:
+                    allCommits = get_revisions_for_failed_verification(project)
+                    self.stdout.write('Found {} commits that previously failed'.format(len(allCommits)))
+                    self.stdout.write('Overwriting commit verification data for {} previously failed commits'.format(len(allCommits)))
 
-                # 3. Iterate foreach commit over the files
+                # close connection because the above may take a long time
+                connections['default'].close()
 
-                self.validate_Metric(path,db_commit, resultModel)
+                # 2. Iterate over the commits
+                for commit in allCommits:
+                    # print("Commit " + commit)
 
-                # Save the model
-                resultModel.save()
-                #if(resultModel.vcsSHARK == False):
-                #    print(resultModel.text)
+                    try:
+                        resultModel = CommitVerification.objects.get(project=project, vcs_system=vcsMongo['url'], commit=str(commit))
+                    except CommitVerification.DoesNotExist:
+                        resultModel = CommitVerification()
+                        resultModel.project = project
+                        resultModel.vcs_system = vcsMongo['url']
+                        resultModel.commit = str(commit)
 
-                # Reset repo to iterate over all commits
-                repo.reset(repo.head.target.hex, pygit2.GIT_RESET_HARD)
-                ref.delete()
+                    resultModel.text = ""
 
-        print("validation complete")
+                    db_commit = get_commit_from_database(self.db, commit, vcsMongo["_id"])
+
+                    # Basic validation wihtout checkout the version
+                    if not db_commit:
+                        self.stdout.write('commit {} not in database, skipping validation'.format(commit))
+                        continue
+                    try:
+                        resultModel.vcsSHARK = self.validate_vcsSHARK(db_commit, repo, resultModel)
+                    except KeyError:
+                        self.stdout.write('commit {} in database but not in repository, skipping validation'.format(commit))
+                        continue
+
+                    # Checkout, to validate also on file level
+                    ref = repo.create_reference('refs/tags/temp', commit)
+
+                    # pygit2.GIT_CHECKOUT_FORCE | pygit2.GIT_CHECKOUT_RECREATE_MISSING
+                    repo.checkout(ref, strategy=pygit2.GIT_CHECKOUT_FORCE | pygit2.GIT_CHECKOUT_RECREATE_MISSING)
+
+                    # 3. Iterate foreach commit over the files
+
+                    self.validate_Metric(path, db_commit, resultModel)
+
+                    # Save the model
+                    resultModel.save()
+                    #if(resultModel.vcsSHARK == False):
+                    #    print(resultModel.text)
+
+                    # Reset repo to iterate over all commits
+                    repo.reset(repo.head.target.hex, pygit2.GIT_RESET_HARD)
+                    ref.delete()
+
+        self.stdout.write("validation complete")
 
     # Plugins validation methods
     def validate_vcsSHARK(self, commit, repo, resultModel):
@@ -86,7 +129,7 @@ class Command(BaseCommand):
             if db_file_action["_id"] not in unvalidated_file_actions_ids:
                 unvalidated_file_actions_ids.append(db_file_action["_id"])
 
-        validated_file_actions = 0 # counter for the validation
+        validated_file_actions = 0  # counter for the validation
 
         repo_commit = repo.revparse_single(commit["revision_hash"])
 
@@ -147,7 +190,6 @@ class Command(BaseCommand):
                         for file in self.db.file.find({"_id": db_file_action["file_id"]}):
                             db_file = file
 
-
                         if filepath == db_file["path"]:
                             if repo_file_action.items() <= db_file_action.items():
                                 if db_file_action["_id"] in unvalidated_file_actions_ids:
@@ -182,9 +224,8 @@ class Command(BaseCommand):
                         resultModel.text = resultModel.text + "\n File action missing!"
                         globalResult = False
 
-
         if(len(unvalidated_file_actions_ids) != 0):
-            self.stdout.write("warning: {} file actions found in the database, but not in the repo!".format(len(unvalidated_file_actions_ids)))
+            self.stderr.write("warning: {} file actions found in the database, but not in the repo!".format(len(unvalidated_file_actions_ids)))
 
         # self.stdout.write("validation of file actions : {} ".format(validated_file_actions))
         return globalResult
@@ -194,7 +235,7 @@ class Command(BaseCommand):
         code_entity_state_coastSHARK = []
         code_entity_state_mecoSHARK = []
 
-        list_code_entity = get_code_entities_from_database(self.db, db_commit["code_entity_states"])
+        list_code_entity = get_code_entities_from_database(self.db, db_commit, self.use_meme)
 
         for db_code_entity_state in list_code_entity:
             if db_code_entity_state["ce_type"] == 'file':
@@ -203,31 +244,28 @@ class Command(BaseCommand):
 
         # Validate on coastSHARK
         resultModel.text = resultModel.text + "\n +++ coastSHARK +++"
-        resultModel.coastSHARK = self.validate_on_file_level(path,code_entity_state_coastSHARK,resultModel)
+        resultModel.coastSHARK = self.validate_on_file_level(path, code_entity_state_coastSHARK, resultModel)
 
         # Validate mecoSHARK
         resultModel.text = resultModel.text + "\n +++ mecoSHARK +++"
-        resultModel.mecoSHARK = self.validate_on_file_level(path,code_entity_state_mecoSHARK,resultModel)
-
+        resultModel.mecoSHARK = self.validate_on_file_level(path, code_entity_state_mecoSHARK, resultModel)
 
     # File level validation
     def validate_coastSHARK(self, db_code_entity_state, code_entity_state_coastSHARK):
         if "node_count" in db_code_entity_state["metrics"]:
             if db_code_entity_state["metrics"]["node_count"] > 0:
-                  code_entity_state_coastSHARK.append(db_code_entity_state["long_name"])
-
+                code_entity_state_coastSHARK.append(db_code_entity_state["long_name"])
 
     def validate_mecoSHARK(self, db_code_entity_state, code_entity_state_mecoSHARK):
         if "LOC" in db_code_entity_state["metrics"]:
             if db_code_entity_state["metrics"]["LOC"]:
-                  code_entity_state_mecoSHARK.append(db_code_entity_state["long_name"])
-
+                code_entity_state_mecoSHARK.append(db_code_entity_state["long_name"])
 
     def validate_on_file_level(self, path, unvalidated_code_entity_state_longnames, resultModel):
         globalResult = True
         for root, dirs, files in os.walk(path):
             for file in files:
-                if file.endswith('.java'):
+                if file.lower().endswith('.java'):
 
                     filepath = os.path.join(root, file)
                     filepath = filepath.replace(path + "/", '')

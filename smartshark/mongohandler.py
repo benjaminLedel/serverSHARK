@@ -3,6 +3,7 @@ from collections import OrderedDict
 from pymongo import MongoClient
 from bson.objectid import ObjectId
 from pymongo.errors import OperationFailure
+from pycoshark.utils import get_code_entity_state_identifier
 
 import server.settings
 
@@ -18,7 +19,9 @@ class MongoHandler(object):
         self.schema_collection = server.settings.DATABASES['mongodb']['PLUGIN_SCHEMA_COLLECTION']
 
         self.client = MongoClient(host=self.address, port=self.port)
-        if self.user is not None and self.password is not None and self.authentication_database is not None:
+        if self.user is not None and self.user != '' \
+                and self.password is not None and self.password != '' \
+                and self.authentication_database is not None and self.authentication_database != '':
             self.client[self.database].authenticate(self.user, self.password, source=self.authentication_database)
 
     def add_user(self, username, password, roles):
@@ -187,6 +190,37 @@ class MongoHandler(object):
         except IndexError:
             pass
         return url
+
+    def clear_code_entity_state_lists(self, revision_hashes, vcs_system_url):
+        revision_hashes = revision_hashes.split(',')
+        vs = self.client.get_database(self.database).get_collection('vcs_system').find_one({'url': vcs_system_url})
+
+        # new changes
+        # 1. find all childs where the parent is in the list that are not themselves contained in the list
+        # 2. for each child get the CES from the list and check if the commit_id is in the list of commits where we delete the code_entity_states
+        # 3. if yes change the commit_id to the childs id
+
+        # prefetch the commit_ids for our revision_hashes for 2,3
+        commit_ids = [ObjectId(c['_id']) for c in self.client.get_database(self.database).get_collection('commit').find({'vcs_system_id': ObjectId(vs['_id']), 'revision_hash': {'$in': revision_hashes}}, {'_id': 1})]
+
+        # 2, 3
+        changed_commit_ids = 0
+        num_childs = 0
+        should_change_commit_ids = 0
+        for c in self.client.get_database(self.database).get_collection('commit').find({'vcs_system_id': ObjectId(vs['_id']), 'parents': {'$in': revision_hashes}, 'revision_hash': {'$nin': revision_hashes}}, no_cursor_timeout=True):
+            # update_result_commit = self.client.get_database(self.database).get_collection('code_entity_state').update_many({'_id': {'$in': c['code_entity_states']}, 'commit_id': {'$in': commit_ids}}, {'$set': {'commit_id': c['_id']}})
+
+            # change commit_id and shard key
+            for ces in self.client.get_database(self.database).get_collection('code_entity_state').find({'_id': {'$in': c['code_entity_states']}, 'commit_id': {'$in': commit_ids}}, {'_id': 1, 'long_name': 1, 'file_id': 1}, no_cursor_timeout=True):
+                s_key = get_code_entity_state_identifier(ces['long_name'], c['_id'], ces['file_id'])
+                update_result_commit = self.client.get_database(self.database).get_collection('code_entity_state').update_one({'_id': ces['_id']}, {'$set': {'commit_id': c['_id'], 's_key': s_key}})
+                changed_commit_ids += update_result_commit.matched_count
+                should_change_commit_ids += 1
+            num_childs += 1
+
+        # delete code_entity_states
+        update_result = self.client.get_database(self.database).get_collection('commit').update_many({'revision_hash': {'$in': revision_hashes}, 'vcs_system_id': vs['_id']}, {'$set': {'code_entity_states': []}})
+        return update_result.matched_count, changed_commit_ids, should_change_commit_ids, num_childs
 
 
 handler = MongoHandler()

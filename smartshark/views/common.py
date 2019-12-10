@@ -78,17 +78,27 @@ def documentation(request):
     data = []
 
     for schema in handler.get_plugin_schemas():
+
         plugin_name = schema['plugin']
+
         for mongo_collection in schema['collections']:
-            print(mongo_collection)
-            collection = Item(mongo_collection['collection_name'], mongo_collection['collection_name'], desc={'desc': mongo_collection['desc'], 'plugin': ' '.join(plugin_name.split('_'))})
+
+            desc = ''
+            if 'desc' in mongo_collection.keys():
+                desc = mongo_collection['desc']
+
+            collection_name = ''
+            if 'collection_name' in mongo_collection.keys():
+                collection_name = mongo_collection['collection_name']
+
+            collection = Item(collection_name, collection_name, desc={'desc': desc, 'plugin': ' '.join(plugin_name.split('_'))})
             if collection.id in items:
                 stored_collection = items[collection.id]
-                stored_collection.add_description({'desc': mongo_collection['desc'], 'plugin': ' '.join(plugin_name.split('_'))})
+                stored_collection.add_description({'desc': desc, 'plugin': ' '.join(plugin_name.split('_'))})
             else:
                 items[collection.id] = collection
 
-            recursion(mongo_collection, mongo_collection['collection_name'], plugin_name, items)
+            recursion(mongo_collection, collection_name, plugin_name, items)
 
     for item_id, item_data in items.items():
         json_collection = {
@@ -129,6 +139,11 @@ def plugin_execution_status(request, id):
 
     job_filter = JobExecutionFilter(request.GET, queryset=Job.objects.all().filter(plugin_execution=plugin_execution))
 
+    rev = [exitjob.revision_hash if exitjob.revision_hash else '' for exitjob in job_filter.qs.filter(status='EXIT')]
+    exit_job_revisions = ''
+    if rev:
+        exit_job_revisions = ','.join(rev)
+
     # Set up pagination
     paginator = Paginator(job_filter.qs, 10)
     page = request.GET.get('page')
@@ -148,8 +163,9 @@ def plugin_execution_status(request, id):
         'overall': len(job_filter.qs),
         'queried_status': job_filter.data.get('status', None),
         'done_jobs': len(job_filter.qs.filter(status='DONE')),
-        'exit_jobs': len(job_filter.qs.filter(status='EXIT')),
-        'waiting_jobs': len(job_filter.qs.filter(status='WAIT'))
+        'exit_jobs': len(rev),
+        'waiting_jobs': len(job_filter.qs.filter(status='WAIT')),
+        'exit_job_revisions': exit_job_revisions
     })
 
 

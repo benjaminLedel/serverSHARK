@@ -1,9 +1,12 @@
 import os
+import re
 import string
 import subprocess
 import threading
 import uuid
 import logging
+
+from pycoshark.mongomodels import VCSSystem
 
 from server.settings import HPC
 
@@ -50,12 +53,13 @@ class HPCConnector(PluginManagementInterface, BaseConnector):
 
     """
     def __init__(self):
+        super(HPCConnector, self).__init__()
         self.username = HPC['username']
         self.password = HPC['password']
         self.host = HPC['host']
         self.port = HPC['port']
         self.queue = HPC['queue']
-        self.node_properties = HPC['node_properties']
+        self.hosts_per_job = HPC['hosts_per_job']
         self.plugin_path = os.path.join(HPC['root_path'], 'plugins')
         self.project_path = os.path.join(HPC['root_path'], 'projects')
         self.log_path = HPC['log_path']
@@ -65,6 +69,7 @@ class HPCConnector(PluginManagementInterface, BaseConnector):
         self.tunnel_port = HPC['ssh_tunnel_port']
         self.use_tunnel = HPC['ssh_use_tunnel']
         self.cores_per_job = HPC['cores_per_job']
+        self.local_log_path = HPC['local_log_path']
 
     @property
     def identifier(self):
@@ -89,20 +94,18 @@ class HPCConnector(PluginManagementInterface, BaseConnector):
         if job.plugin_execution.queue:
             queue = job.plugin_execution.queue
 
-        bsub_command = 'bsub -n %s -W 48:00 -q %s -o %s -e %s -J "%s" ' % (cores_per_job, queue,
-                                                                           output_path, error_path, job.id)
+        # bsub_command = 'bsub -n %s -W 48:00 -q %s -o %s -e %s -J "%s" ' % (cores_per_job, queue, output_path, error_path, job.id)
+        bsub_command = '/opt/slurm/bin/sbatch -n %s -t 2-00:00:00 -p %s -o %s -e %s -N %s -J "%s" ' % (cores_per_job, queue, output_path, error_path, self.hosts_per_job, job.id)
 
-        req_jobs = job.requires.all()
-        if req_jobs:
-            bsub_command += "-w '"
-            for req_job in req_jobs:
-                bsub_command += 'ended("%s") && ' % str(req_job.id)
+        # required jobs no longer used
+        # req_jobs = job.requires.all()
+        # if req_jobs:
+        #     bsub_command += "-w '"
+        #     for req_job in req_jobs:
+        #         bsub_command += 'ended("%s") && ' % str(req_job.id)
 
-            bsub_command = bsub_command[:-4]
-            bsub_command += "' "
-
-        for node_property in self.node_properties:
-            bsub_command += "-R %s " % node_property
+        #     bsub_command = bsub_command[:-4]
+        #     bsub_command += "' "
 
         command = string.Template(plugin_command).safe_substitute({
             'path': os.path.join(self.project_path, job.plugin_execution.project.name),
@@ -147,21 +150,64 @@ class HPCConnector(PluginManagementInterface, BaseConnector):
         return None
 
     def prepare_project(self, plugin_executions):
-        # As all plugin executions need to have the same repository url, we just look if we find a execution with a
-        # set repository url
-        found_plugin_execution = self.get_plugin_execution_where_repository_url_is_set(plugin_executions)
 
-        if found_plugin_execution is not None:
+        # TODO: Fails on multiple repositories for one project in the same plugin_execution list
+        # Check if vcsshark is executed
+        found_plugin_execution = self.get_plugin_execution_where_repository_url_is_set(plugin_executions)
+        project_folder = os.path.join(self.project_path, found_plugin_execution.project.name)
+        if any('vcsshark' == plugin_exec.plugin.name.lower() for plugin_exec in plugin_executions):
             # Create project folder
-            git_clone_target = os.path.join(self.project_path, found_plugin_execution.project.name)
-            self.execute_command('rm -rf %s' % git_clone_target, ignore_errors=True)
-            self.execute_command('git clone %s %s ' % (found_plugin_execution.repository_url, git_clone_target),
+            self.execute_command('rm -rf %s' % project_folder, ignore_errors=True)
+            self.execute_command('git clone %s %s ' % (found_plugin_execution.repository_url, project_folder),
                                  ignore_errors=True)
+        else:
+            # If there is a plugin that needs the repository folder and it is not existent,
+            # we need to get it from the gridfs
+            if found_plugin_execution is not None and not os.path.isdir(project_folder):
+                repository = VCSSystem.objects.get(url=found_plugin_execution.repository_url).repository_file
+
+                if repository.grid_id is None:
+                    logger.error("Execute vcsshark first!")
+                    raise Exception("VCSShark need to be executed first!")
+
+                # Read tar_gz and copy it to temporary file
+                tmp_tar_gz = 'tmp.tar.gz'
+                with open(tmp_tar_gz, 'wb') as repository_tar_gz:
+                    repository_tar_gz.write(repository.read())
+
+                # Copy and extract tar on HPC system
+                self.copy_project_tar()
+
+                # Delete temporary tar_gz
+                os.remove(tmp_tar_gz)
+
 
     def delete_output_for_plugin_execution(self, plugin_execution):
         self.execute_command('rm -rf %s' % os.path.join(self.log_path, str(plugin_execution.id)))
 
     def get_output_log(self, job):
+        if self.local_log_path:
+            return self._get_log_local(job, log_type='out')
+        else:
+            return self._get_output_log_ssh(job)
+
+    def get_error_log(self, job):
+        if self.local_log_path:
+            return self._get_log_local(job, log_type='err')
+        else:
+            return self._get_error_log_ssh(job)
+
+    def _get_log_local(self, job, log_type='out'):
+        output = []
+
+        file_path = os.path.join(self.local_log_path, str(job.plugin_execution.id), str(job.id) + '_' + log_type + '.txt')
+
+        with open(file_path, 'r') as f:
+            output = [line.strip() for line in f.readlines()]
+
+        return output
+
+    def _get_output_log_ssh(self, job):
         with ShellHandler(self.host, self.username, self.password, self.port, self.tunnel_host,
                           self.tunnel_username, self.tunnel_password, self.tunnel_port, self.use_tunnel, 10021) as handler:
             sftp_client = handler.get_ssh_client().open_sftp()
@@ -180,7 +226,7 @@ class HPCConnector(PluginManagementInterface, BaseConnector):
 
         return output
 
-    def get_error_log(self, job):
+    def _get_error_log_ssh(self, job):
         with ShellHandler(self.host, self.username, self.password, self.port, self.tunnel_host,
                           self.tunnel_username, self.tunnel_password, self.tunnel_port, self.use_tunnel, 10022) as handler:
             sftp_client = handler.get_ssh_client().open_sftp()
@@ -200,29 +246,108 @@ class HPCConnector(PluginManagementInterface, BaseConnector):
         return output
 
     def get_job_stati(self, jobs):
-        if not jobs:
-            return []
+        """Use slurms sacct to fetch the job status for the given list of jobs.
 
-        job_status_list = []
-        commands = []
-        plugin_execution_output_path = os.path.join(self.log_path, str(jobs[0].plugin_execution.id))
-        for job in jobs:
-            error_path = os.path.join(plugin_execution_output_path, str(job.id) + '_err.txt')
-            commands.append("wc -c < %s" % error_path)
+        possible formats and job states: https://slurm.schedmd.com/sacct.html
+        """
+        results = []
+        job_ids = [str(job.id) for job in jobs]
 
-        out = self.send_and_execute_file(commands, True)
-        logger.debug(out)
-        for out_line in out:
-            out_line = out_line.strip()
-            if out_line == '0':
-                job_status_list.append('DONE')
-            elif 'No such file or directory' in out_line:
-                job_status_list.append('WAIT')
-            else:
-                job_status_list.append('EXIT')
+        # 1. create job id batches
+        for start in range(0, len(job_ids), 3000):
+            chunk = job_ids[start:start + 3000]
+            command = '/opt/slurm/bin/sacct -S 2019-01-01 --name {} --format="JobName,State"'.format(','.join(chunk))
+            stdout = self.execute_command(command)
 
-        logger.debug(job_status_list)
-        return job_status_list
+            states = {}
+            for line in stdout[1:]:
+                m = list(re.findall(r'\S+', line))  # split on any number of consecutive whitespaces
+                if len(m) == 2:
+                    states[m[0]] = m[1]
+
+            for jid in chunk:
+                if jid not in states.keys():
+                    results.append('WAIT')
+                elif states[jid].lower() == 'completed':
+                    results.append('DONE')
+                elif states[jid].lower() in ['pending', 'running', 'requeued', 'resizing', 'suspended']:
+                    results.append('WAIT')
+                else:
+                    results.append('EXIT')
+
+        return results
+
+    # old lsf style
+    # def get_job_stati(self, jobs):
+    #     old lsf style
+    #     if self.local_log_path:
+    #         return self._get_job_stati_local(jobs)
+    #     else:
+    #         return self._get_job_stati_ssh(jobs)
+
+    # old lsf style
+    # def _get_job_stati_local(self, jobs):
+    #     if not jobs:
+    #         return []
+
+    #     job_status_list = []
+    #     plugin_execution_output_path = os.path.join(self.local_log_path, str(jobs[0].plugin_execution.id))
+
+    #     for job in jobs:
+    #         error_path = os.path.join(plugin_execution_output_path, str(job.id) + '_err.txt')
+    #         out_path = os.path.join(plugin_execution_output_path, str(job.id) + '_out.txt')
+
+    #         # file not present, job is not finished
+    #         if not os.path.isfile(out_path) or not os.path.isfile(error_path):
+    #             job_status_list.append('WAIT')
+    #             continue
+
+    #         # we have error logs something is wrong
+    #         if os.path.getsize(error_path) > 0:
+    #             job_status_list.append('EXIT')
+    #             continue
+
+    #         # last, we check the state
+    #         try:
+    #             with open(out_path, 'r') as f:
+    #                 head = [next(f) for x in range(2)]
+
+    #             # either we are Done or otherwise killed
+    #             if head[1].strip().endswith(' Done'):
+    #                 job_status_list.append('DONE')
+    #             else:
+    #                 job_status_list.append('EXIT')
+
+    #         # this happens if we do not have 2 lines in the file
+    #         except StopIteration:
+    #             job_status_list.append('EXIT')
+
+    #     return job_status_list
+
+    # def _get_job_stati_ssh(self, jobs):
+    #     if not jobs:
+    #         return []
+
+    #     job_status_list = []
+    #     commands = []
+    #     plugin_execution_output_path = os.path.join(self.log_path, str(jobs[0].plugin_execution.id))
+    #     for job in jobs:
+    #         error_path = os.path.join(plugin_execution_output_path, str(job.id) + '_err.txt')
+    #         commands.append("wc -c < %s" % error_path)
+
+    #     out = self.send_and_execute_file(commands, True)
+    #     logger.debug(out)
+    #     for out_line in out:
+    #         out_line = out_line.strip()
+    #         if out_line == '0':
+    #             job_status_list.append('DONE')
+    #         elif 'No such file or directory' in out_line:
+    #             job_status_list.append('WAIT')
+    #         else:
+    #             job_status_list.append('EXIT')
+
+    #     logger.debug(job_status_list)
+    #     return job_status_list
 
     def delete_plugins(self, plugins):
         for plugin in plugins:
@@ -262,6 +387,21 @@ class HPCConnector(PluginManagementInterface, BaseConnector):
 
         # Delete tar
         self.execute_command('rm -f ~/%s' % (plugin.get_name_of_archive()))
+
+    def copy_project_tar(self):
+        with ShellHandler(self.host, self.username, self.password, self.port, self.tunnel_host,
+                          self.tunnel_username, self.tunnel_password, self.tunnel_port, self.use_tunnel, 10023) as handler:
+            scp = SCPClient(handler.get_ssh_client().get_transport())
+
+            # Copy plugin
+            scp.put('tmp.tar.gz', remote_path=b'~')
+
+        # Untar plugin
+        self.execute_command('mkdir %s' % self.project_path)
+        self.execute_command('tar -C %s -xvf ~/tmp.tar.gz' % self.project_path)
+
+        # Delete tar
+        self.execute_command('rm -f ~/tmp.tar.gz')
 
     def execute_install(self, plugin):
         # Build parameter for install script.

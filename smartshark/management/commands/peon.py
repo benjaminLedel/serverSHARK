@@ -9,10 +9,11 @@ import subprocess
 
 import redis
 
-from smartshark.models import Job
-
 from django.conf import settings
+from django.db import connections
 from django.core.management.base import BaseCommand
+
+from smartshark.models import Job
 
 
 class Command(BaseCommand):
@@ -43,6 +44,8 @@ class Command(BaseCommand):
                 self.stdout.write('executing: {} ... '.format(data['shell']), ending=b'')
                 sys.stdout.flush()
 
+                # close db connection because we may have long running jobs
+                connections['default'].close()
                 res = subprocess.run(data['shell'].split(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
                 end = timeit.default_timer() - start
@@ -73,8 +76,15 @@ class Command(BaseCommand):
 
                     with open(output_file, 'w') as f:
                         f.write(res.stdout.decode('utf-8'))
+                    
                     with open(error_file, 'w') as f:
                         f.write(res.stderr.decode('utf-8'))
+
+                    # analogous to the HPC Jobs we set the job to exit if we have output to stderr
+                    if res.stderr:
+                        job.status = 'EXIT'
+                        job.save()
+
                 self.stdout.write('{} jobs left in queue'.format(self.con.llen(self.job_queue)))
 
     def handle(self, *args, **options):
